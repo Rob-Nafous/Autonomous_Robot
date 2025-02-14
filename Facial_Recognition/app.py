@@ -2,35 +2,42 @@ import gradio as gr
 import cv2
 import numpy as np
 import face_recognition
-import os
-from pymongo import MongoClient
-from pymongo.errors import DuplicateKeyError
-from pymongo.server_api import ServerApi
+import sqlite3
+import json
 
-# Connexion MongoDB
-uri = os.getenv('MONGODBPASSCODE')
-client = MongoClient(uri, server_api=ServerApi('1'))
-collection = client['users']['faces']
+# Connexion à la base de données SQLite
+conn = sqlite3.connect("faces.db", check_same_thread=False)
+cursor = conn.cursor()
 
-# Assurer l'unicité des usernames
-if "username_1" not in collection.index_information():
-    collection.create_index("username", unique=True)
+# Création de la table pour stocker les embeddings
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,   
+        username TEXT UNIQUE,
+        embedding TEXT
+    )
+''')
+conn.commit()
 
-# Chargement initial des embeddings
+# Dictionnaire pour stocker les embeddings en mémoire
 user_embeddings = {}
 
 def load_embeddings():
+    """Charge les embeddings des utilisateurs depuis SQLite."""
     global user_embeddings
-    user_embeddings.clear()  # Reset pour éviter doublons
-    for user in collection.find():
-        username = user['username']
-        embedding = np.array(user['embedding'], dtype=np.float64)  # Convertir en NumPy array
+    user_embeddings.clear()
+    
+    cursor.execute("SELECT username, embedding FROM users")
+    for username, embedding_json in cursor.fetchall():
+        embedding = np.array(json.loads(embedding_json), dtype=np.float64)
         user_embeddings[username] = {'face': embedding}
+    
     print(f"Loaded {len(user_embeddings)} users.")
 
 load_embeddings()
 
 def recognize_user(image):
+    """Reconnaît un utilisateur ou propose l'enregistrement si inconnu."""
     img = np.array(image)
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
@@ -58,26 +65,28 @@ def recognize_user(image):
     return "Hello " + ", ".join(recognized_names), None, recognized_names
 
 def register_user(name, embedding):
+    """Enregistre un nouvel utilisateur avec son embedding."""
     if not name:
         return "Error: Name field is empty."
     if name in user_embeddings:
         return "Error: Name already taken."
 
     try:
-        embedding_list = embedding.tolist()
-        document = {'username': name, 'embedding': embedding_list}
-        collection.insert_one(document)
+        embedding_json = json.dumps(embedding.tolist())
+        cursor.execute("INSERT INTO users (username, embedding) VALUES (?, ?)", (name, embedding_json))
+        conn.commit()
 
-        # Mettre à jour user_embeddings en direct
-        user_embeddings[name] = {'face': np.array(embedding_list, dtype=np.float64)}
+        # Mise à jour du dictionnaire local
+        user_embeddings[name] = {'face': np.array(embedding, dtype=np.float64)}
 
         return f"User {name} registered successfully!"
-    except DuplicateKeyError:
+    except sqlite3.IntegrityError:
         return f"Error: The username '{name}' is already registered."
     except Exception as e:
         return f"Error registering user: {str(e)}"
 
 def recognize(unknown_embedding):
+    """Compare l'embedding inconnu avec ceux enregistrés pour identifier un utilisateur."""
     threshold = 0.6
     min_dis_id = 'unknown_person'
     min_distance = threshold
@@ -92,6 +101,7 @@ def recognize(unknown_embedding):
     return min_dis_id, min_distance
 
 def process_frame(image, name):
+    """Gère la reconnaissance et l'enregistrement des visages."""
     message, embedding, recognized_names = recognize_user(image)
     if embedding is not None and name:
         registration_message = register_user(name, embedding)
@@ -107,7 +117,7 @@ iface = gr.Interface(
     ],
     outputs="text",
     live=True,
-    title="Real-Time Face Recognition and Registration",
+    title="Real-Time Face Recognition and Registration (SQLite)",
     allow_flagging='never'
 )
 
